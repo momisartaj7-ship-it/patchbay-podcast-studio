@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Patchbay — Video Podcast Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+<!-- ===================== ENTRY SCREEN ===================== -->
+<section id="entry-screen" class="screen">
+  <div class="entry-wrap">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Patchbay</span>
+    </div>
+
+    <div class="entry-panel">
+      <h1>Set up your session</h1>
+      <p class="entry-sub">Every guest records locally in full quality. Nothing is lost to a bad connection.</p>
+
+      <label class="field">
+        <span class="field-label">Your name</span>
+        <input type="text" id="input-name" placeholder="e.g. Sartaj" maxlength="30" autocomplete="off" />
+      </label>
+
+      <label class="field">
+        <span class="field-label">Room code</span>
+        <input type="text" id="input-room" placeholder="e.g. tuesday-ep12" maxlength="40" autocomplete="off" />
+      </label>
+
+      <div class="entry-actions">
+        <button id="btn-join" class="btn btn-primary">Enter studio</button>
+      </div>
+      <p class="entry-hint">You'll get a one-click invite link to send your guest once you're in.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== ROOM SCREEN ===================== -->
+<section id="room-screen" class="screen hidden">
+  <header class="console-bar">
+    <div class="console-left">
+      <span class="brand-mark small" aria-hidden="true"></span>
+      <span class="room-code-label">Room <strong id="display-room"></strong></span>
+      <button id="btn-copy-link" class="link-btn" title="Copy an invite link for your guest">Copy invite link</button>
+    </div>
+    <div class="console-center">
+      <span id="rec-indicator" class="rec-indicator hidden">
+        <span class="rec-dot"></span> REC
+      </span>
+      <span id="session-timer" class="session-timer">00:00:00</span>
+    </div>
+    <div class="console-right">
+      <span id="connection-status" class="connection-status">waiting for guest…</span>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div class="tile" id="tile-local">
+      <video id="video-local" autoplay playsinline muted></video>
+      <div class="tile-label"><span id="label-local-name">You</span></div>
+    </div>
+    <div class="tile" id="tile-remote">
+      <video id="video-remote" autoplay playsinline></video>
+      <div class="tile-label"><span id="label-remote-name">Waiting…</span></div>
+      <div class="tile-empty" id="tile-remote-empty">
+        <p>Send your guest this link:</p>
+        <p class="room-code-big" id="room-code-big"></p>
+        <button id="btn-copy-link-tile" class="btn btn-secondary link-btn-tile">Copy invite link</button>
+      </div>
+    </div>
+  </main>
+
+  <footer class="control-strip">
+    <div class="control-group">
+      <button id="btn-mic" class="ctrl-btn" aria-pressed="true" title="Mute microphone">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+      </button>
+      <button id="btn-cam" class="ctrl-btn" aria-pressed="true" title="Turn off camera">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4Z"/></svg>
+      </button>
+    </div>
+
+    <div class="control-group control-group-center">
+      <button id="btn-record" class="ctrl-btn ctrl-record">
+        <span class="rec-btn-dot"></span> Start recording
+      </button>
+    </div>
+
+    <div class="control-group">
+      <button id="btn-leave" class="ctrl-btn ctrl-leave">Leave studio</button>
+    </div>
+  </footer>
+</section>
+
+<!-- ===================== SESSION ENDED SCREEN ===================== -->
+<section id="end-screen" class="screen hidden">
+  <div class="entry-wrap">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Patchbay</span>
+    </div>
+    <div class="entry-panel">
+      <h1>Session wrapped</h1>
+      <p class="entry-sub">Each participant's high-quality local recording is listed below as it finishes uploading.</p>
+      <ul id="files-list" class="files-list"></ul>
+      <div class="entry-actions">
+        <button id="btn-restart" class="btn btn-secondary">Start a new session</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
