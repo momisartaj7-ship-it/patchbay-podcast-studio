@@ -143,6 +143,7 @@
     }
 
     videoLocal.srcObject = localStream;
+    videoLocal.style.transform = 'scaleX(-1)';
     labelLocalName.textContent = `${myName} (you)`;
     displayRoom.textContent = myRoom;
     roomCodeBig.textContent = buildInviteLink(myRoom);
@@ -261,12 +262,13 @@
     if (command === 'stop') stopPodcastRecording();
   });
 
-  function drawVideoCover(ctx, video, x, y, w, h) {
+  function drawVideoCover(ctx, video, x, y, w, h, mirror = true) {
     if (!video || video.readyState < 2) {
       ctx.fillStyle = '#0D0F13';
       ctx.fillRect(x, y, w, h);
       return;
     }
+
     const vw = video.videoWidth || 16;
     const vh = video.videoHeight || 9;
     const scale = Math.max(w / vw, h / vh);
@@ -274,7 +276,18 @@
     const sh = h / scale;
     const sx = (vw - sw) / 2;
     const sy = (vh - sh) / 2;
-    ctx.drawImage(video, sx, sy, sw, sh, x, y, w, h);
+
+    ctx.save();
+
+    if (mirror) {
+      ctx.translate(x + w, y);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+    } else {
+      ctx.drawImage(video, sx, sy, sw, sh, x, y, w, h);
+    }
+
+    ctx.restore();
   }
 
   function drawPodcastFrame() {
@@ -287,8 +300,8 @@
     compositeCtx.fillStyle = '#0D0F13';
     compositeCtx.fillRect(0, 0, w, h);
 
-    drawVideoCover(compositeCtx, videoLocal, 0, 0, tileW, h);
-    drawVideoCover(compositeCtx, videoRemote, tileW + gap, 0, tileW, h);
+    drawVideoCover(compositeCtx, videoLocal, 0, 0, tileW, h, true);
+    drawVideoCover(compositeCtx, videoRemote, tileW + gap, 0, tileW, h, true);
 
     // Podcast-style name plates.
     compositeCtx.fillStyle = 'rgba(20, 23, 28, 0.78)';
