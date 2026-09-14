@@ -94,6 +94,46 @@ app.post('/upload', upload.single('recording'), async (req, res) => {
   }
 });
 
+
+// Force recordings to download instead of opening in the browser.
+app.get('/download-recording/:room/:filename', async (req, res) => {
+  try {
+    const room = String(req.params.room || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const filename = String(req.params.filename || '');
+    if (!room || !filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+      return res.status(400).send('Invalid recording path');
+    }
+
+    const key = `recordings/${room}/${filename}`;
+
+    // S3-compatible storage: fetch the object and force attachment disposition.
+    if (s3Client && GetObjectCommand) {
+      const obj = await s3Client.send(new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+      }));
+
+      res.setHeader('Content-Type', obj.ContentType || 'video/webm');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+      if (obj.ContentLength != null) res.setHeader('Content-Length', String(obj.ContentLength));
+      if (obj.Body?.pipe) return obj.Body.pipe(res);
+
+      const chunks = [];
+      for await (const chunk of obj.Body) chunks.push(chunk);
+      return res.end(Buffer.concat(chunks));
+    }
+
+    // Local storage fallback.
+    const filePath = path.join(RECORDINGS_DIR, room, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).send('Recording not found');
+
+    res.download(filePath, filename);
+  } catch (err) {
+    console.error('Download recording error:', err);
+    res.status(500).send('Could not download recording');
+  }
+});
+
 app.get('/recordings-list/:room', async (req, res) => {
   const room = sanitize(req.params.room, 'unknown-room');
 

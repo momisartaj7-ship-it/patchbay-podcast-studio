@@ -536,7 +536,7 @@
           </div>
           <div class="recording-card-actions">
             <button class="btn btn-primary play-recording" type="button">▶ Watch</button>
-            <a class="btn btn-secondary" href="${f.url}" download>Download</a>
+            <a class="btn btn-secondary" href="/download-recording/${encodeURIComponent(room)}/${encodeURIComponent(f.name)}">Download</a>
           </div>
         `;
         li.querySelector('.play-recording').addEventListener('click', () => openRecording(f, room));
@@ -552,7 +552,7 @@
       ? `Podcast episode · ${room}`
       : file.name;
     recordingVideo.src = file.url;
-    recordingDownload.href = file.url;
+    recordingDownload.href = `/download-recording/${encodeURIComponent(room)}/${encodeURIComponent(file.name)}`;
     recordingPlayer.classList.remove('hidden');
     recordingVideo.play().catch(() => {});
   }
