@@ -2,9 +2,9 @@
 
 A browser-based, two-person video podcast studio. Riverside-style: each
 participant's camera and mic are recorded **locally in their own browser**
-at full quality, then uploaded to the host's server after the session —
-so a shaky internet connection during the call never touches the final
-recording quality. The live call itself runs over WebRTC just so both of
+at full quality, then combined by the host browser into one podcast-style side-by-side episode
+and uploaded to the server after the session. The live call still runs over
+WebRTC, while the final episode is rendered locally in the host browser. The live call itself runs over WebRTC just so both of
 you can see and hear each other while you talk.
 
 ## How it works
@@ -12,10 +12,10 @@ you can see and hear each other while you talk.
 - **Live call:** peer-to-peer WebRTC, connected via a small signaling
   server (Socket.io). Video never passes through the server — only
   connection setup messages do.
-- **Recording:** when the host clicks "Start recording," every browser
-  in the room starts capturing its own local stream via the
-  `MediaRecorder` API. When the host stops, each browser uploads its
-  own `.webm` file to the server.
+- **Recording:** when the host clicks "Start recording," the host browser
+  renders both participants side-by-side on a 1280×720 canvas, mixes host and
+  guest audio with Web Audio, and records one podcast-style `.webm` episode.
+  The host uploads that combined episode when recording stops.
 - **Files:** saved under `recordings/<room-code>/<name>-av-<timestamp>.webm`,
   downloadable from the "session wrapped" screen at the end.
 

@@ -33,8 +33,9 @@
         <input type="text" id="input-room" placeholder="e.g. tuesday-ep12" maxlength="40" autocomplete="off" />
       </label>
 
-      <div class="entry-actions">
+      <div class="entry-actions entry-actions-stack">
         <button id="btn-join" class="btn btn-primary">Enter studio</button>
+        <button id="btn-recordings-home" class="btn btn-secondary">🎬 Recordings</button>
       </div>
       <p class="entry-hint">You'll get a one-click invite link to send your guest once you're in.</p>
     </div>
@@ -98,20 +99,66 @@
   </footer>
 </section>
 
-<!-- ===================== SESSION ENDED SCREEN ===================== -->
+<!-- ===================== SESSION ENDED / HOME SCREEN ===================== -->
 <section id="end-screen" class="screen hidden">
-  <div class="entry-wrap">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">Patchbay</span>
+  <div class="entry-wrap wide">
+    <div class="home-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Patchbay</span>
+      </div>
+      <button id="btn-recordings-end" class="top-link-btn">🎬 Recordings</button>
     </div>
+
     <div class="entry-panel">
       <h1>Session wrapped</h1>
-      <p class="entry-sub">Each participant's high-quality local recording is listed below as it finishes uploading.</p>
-      <ul id="files-list" class="files-list"></ul>
-      <div class="entry-actions">
+      <p class="entry-sub">Your podcast-style recording is ready. Open Recordings to watch or download your episodes.</p>
+      <div id="upload-status" class="upload-status"></div>
+      <div class="entry-actions entry-actions-stack">
+        <button id="btn-view-recordings" class="btn btn-primary">View recordings</button>
         <button id="btn-restart" class="btn btn-secondary">Start a new session</button>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== RECORDINGS LIBRARY ===================== -->
+<section id="recordings-screen" class="screen hidden">
+  <div class="library-wrap">
+    <header class="library-header">
+      <div>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">Patchbay</span>
+        </div>
+        <h1>Your recordings</h1>
+        <p id="recordings-subtitle" class="entry-sub">Podcast episodes saved for this room.</p>
+      </div>
+      <button id="btn-back-home" class="top-link-btn">← Home</button>
+    </header>
+
+    <div id="recordings-room-picker" class="room-picker">
+      <label class="field">
+        <span class="field-label">Room code</span>
+        <input type="text" id="input-recordings-room" placeholder="e.g. tuesday-ep12" maxlength="40" autocomplete="off" />
+      </label>
+      <button id="btn-load-recordings" class="btn btn-primary">Show recordings</button>
+    </div>
+
+    <div id="recordings-content" class="hidden">
+      <div class="library-toolbar">
+        <span id="library-room-label"></span>
+        <button id="btn-change-room" class="link-btn">Change room</button>
+      </div>
+      <div id="recording-player" class="recording-player hidden">
+        <button id="btn-close-player" class="player-close">← Back to recordings</button>
+        <video id="recording-video" controls playsinline></video>
+        <div class="player-info">
+          <strong id="recording-title"></strong>
+          <a id="recording-download" class="btn btn-secondary download-btn" download>Download</a>
+        </div>
+      </div>
+      <ul id="files-list" class="recordings-grid"></ul>
     </div>
   </div>
 </section>
