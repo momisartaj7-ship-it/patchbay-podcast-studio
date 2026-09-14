@@ -134,7 +134,10 @@
 
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
+        video: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30, max: 30 }},
         audio: { echoCancellation: true, noiseSuppression: true }
       });
     } catch (err) {
@@ -355,8 +358,8 @@
 
     recordedChunks = [];
     compositeCanvas = document.createElement('canvas');
-    compositeCanvas.width = 1280;
-    compositeCanvas.height = 720;
+    compositeCanvas.width = 1920;
+    compositeCanvas.height = 1080;
     compositeCtx = compositeCanvas.getContext('2d');
 
     const canvasStream = compositeCanvas.captureStream(30);
@@ -369,10 +372,11 @@
     const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
       ? 'video/webm;codecs=vp9,opus'
       : 'video/webm';
-    mediaRecorder = new MediaRecorder(finalStream, {
-      mimeType,
-      videoBitsPerSecond: 5_000_000
-    });
+   mediaRecorder = new MediaRecorder(finalStream, {
+     mimeType,
+     videoBitsPerSecond: 8_000_000,
+     audioBitsPerSecond: 192_000
+});
 
     mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) recordedChunks.push(e.data);
