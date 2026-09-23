@@ -50,6 +50,37 @@ function sanitize(value, fallback) {
   return (value || fallback).replace(/[^a-zA-Z0-9-_]/g, '');
 }
 
+// ---- ICE servers: STUN alone can't get through symmetric/carrier-grade NAT,
+// which is common on mobile networks (a big reason cross-country calls fail
+// even though local testing works fine). Set TURN_URL / TURN_USERNAME /
+// TURN_CREDENTIAL to your own TURN provider for reliable production use; with
+// none set, this falls back to Metered's small public "Open Relay" TURN
+// service, which is fine to get unblocked quickly but is a shared public
+// resource, not something to depend on for real use. See README.
+app.get('/ice-servers', (req, res) => {
+  const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+  if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    servers.push({
+      urls: process.env.TURN_URL.split(',').map(s => s.trim()),
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL,
+    });
+  } else {
+    servers.push({
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    });
+  }
+
+  res.json({ iceServers: servers });
+});
+
 // ---- Upload handling: each participant uploads their own local recording ----
 const storage = useCloudStorage
   ? multer.memoryStorage()
@@ -94,6 +125,69 @@ app.post('/upload', upload.single('recording'), async (req, res) => {
   }
 });
 
+
+// Force recordings to download instead of opening in the browser.
+app.get('/download-recording/:room/:filename', async (req, res) => {
+  try {
+    const room = String(req.params.room || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const filename = String(req.params.filename || '');
+
+    if (
+      !room ||
+      !filename ||
+      filename.includes('..') ||
+      filename.includes('/') ||
+      filename.includes('\\')
+    ) {
+      return res.status(400).send('Invalid recording path');
+    }
+
+    // Cloud storage
+    if (useCloudStorage) {
+      const obj = await s3.send(new GetObjectCommand({
+        Bucket: process.env.STORAGE_BUCKET_NAME,
+        Key: `${room}/${filename}`,
+      }));
+
+      res.setHeader('Content-Type', obj.ContentType || 'video/webm');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${filename.replace(/"/g, '')}"`
+      );
+
+      if (obj.ContentLength != null) {
+        res.setHeader('Content-Length', String(obj.ContentLength));
+      }
+
+      if (obj.Body?.pipe) {
+        return obj.Body.pipe(res);
+      }
+
+      const chunks = [];
+      for await (const chunk of obj.Body) {
+        chunks.push(chunk);
+      }
+
+      return res.end(Buffer.concat(chunks));
+    }
+
+    // Local storage
+    const filePath = path.join(RECORDINGS_DIR, room, filename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).send('Recording not found');
+    }
+
+    res.download(filePath, filename);
+
+  } catch (err) {
+    console.error('Download recording error:', err);
+
+    if (!res.headersSent) {
+      res.status(500).send('Could not download recording');
+    }
+  }
+});
 app.get('/recordings-list/:room', async (req, res) => {
   const room = sanitize(req.params.room, 'unknown-room');
 

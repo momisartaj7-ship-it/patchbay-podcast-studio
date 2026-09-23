@@ -2,9 +2,9 @@
 
 A browser-based, two-person video podcast studio. Riverside-style: each
 participant's camera and mic are recorded **locally in their own browser**
-at full quality, then uploaded to the host's server after the session —
-so a shaky internet connection during the call never touches the final
-recording quality. The live call itself runs over WebRTC just so both of
+at full quality, then combined by the host browser into one podcast-style side-by-side episode
+and uploaded to the server after the session. The live call still runs over
+WebRTC, while the final episode is rendered locally in the host browser. The live call itself runs over WebRTC just so both of
 you can see and hear each other while you talk.
 
 ## How it works
@@ -12,10 +12,10 @@ you can see and hear each other while you talk.
 - **Live call:** peer-to-peer WebRTC, connected via a small signaling
   server (Socket.io). Video never passes through the server — only
   connection setup messages do.
-- **Recording:** when the host clicks "Start recording," every browser
-  in the room starts capturing its own local stream via the
-  `MediaRecorder` API. When the host stops, each browser uploads its
-  own `.webm` file to the server.
+- **Recording:** when the host clicks "Start recording," the host browser
+  renders both participants side-by-side on a 1280×720 canvas, mixes host and
+  guest audio with Web Audio, and records one podcast-style `.webm` episode.
+  The host uploads that combined episode when recording stops.
 - **Files:** saved under `recordings/<room-code>/<name>-av-<timestamp>.webm`,
   downloadable from the "session wrapped" screen at the end.
 
@@ -35,6 +35,36 @@ By default, recordings save to a local `recordings/` folder — fine for
 testing, but most free hosting platforms wipe that folder on every
 restart or redeploy. To make recordings durable, connect a free
 Cloudflare R2 bucket instead (see below).
+
+## Reliable connections across networks (TURN server)
+
+By default, calls only use a STUN server, which helps two people connect
+directly but **fails whenever either side is behind a symmetric or
+carrier-grade NAT** — common on mobile networks (this is why a call can
+work fine between two tabs on your own Wi-Fi but fail between, say, the US
+and someone on a mobile carrier in India). A TURN server relays the call
+through a third party when a direct connection isn't possible.
+
+As of this update, the app automatically falls back to a small **public**
+TURN service (Metered's "Open Relay") if you haven't configured your own —
+so calls should now get through in more cases without you doing anything.
+That public service is shared and unmetered by anyone, though, so it's fine
+for getting unblocked quickly but not something to depend on for real use.
+
+For reliable production use, get your own TURN credentials (Metered.ca has
+a solid free tier) and add these to your `.env`:
+
+```
+TURN_URL=turn:standard.relay.metered.ca:80,turn:standard.relay.metered.ca:443,turn:standard.relay.metered.ca:443?transport=tcp
+TURN_USERNAME=your-username
+TURN_CREDENTIAL=your-credential
+```
+
+(Multiple TURN URLs, comma-separated, let the browser try different ports —
+including 443, which gets through almost any firewall since it looks like
+normal HTTPS traffic.) Restart the server, or add the same three variables
+on Render, and it'll use your own TURN credentials automatically instead of
+the public fallback.
 
 ## Durable storage (recommended before real use)
 
