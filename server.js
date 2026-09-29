@@ -2,11 +2,13 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
-const multer = require('multer');
+const os = require('os');
 const { Server } = require('socket.io');
 require('dotenv').config();
 const { S3Client, PutObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { Upload } = require('@aws-sdk/lib-storage');
+const { mergeEpisode } = require('./merge');
 
 const app = express();
 const server = http.createServer(app);
@@ -35,7 +37,13 @@ let s3;
 if (useCloudStorage) {
   s3 = new S3Client({
     region: process.env.STORAGE_REGION || 'auto',
+    // Newer SDK versions add checksum headers by default that some S3-compatible
+    // providers (Backblaze B2, R2) can reject on multipart uploads.
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
     endpoint: process.env.STORAGE_ENDPOINT,
+    // Off by default (Backblaze B2 works as-is). Some self-hosted S3 servers need it.
+    forcePathStyle: process.env.STORAGE_FORCE_PATH_STYLE === 'true',
     credentials: {
       accessKeyId: process.env.STORAGE_ACCESS_KEY_ID,
       secretAccessKey: process.env.STORAGE_SECRET_ACCESS_KEY,
@@ -47,7 +55,15 @@ if (useCloudStorage) {
 }
 
 function sanitize(value, fallback) {
-  return (value || fallback).replace(/[^a-zA-Z0-9-_]/g, '');
+  const cleaned = String(value || '').replace(/[^a-zA-Z0-9-_]/g, '');
+  return cleaned || fallback;
+}
+
+// Display names are shown on the episode's name plates, so keep them readable
+// but strip control characters and cap the length.
+function displayName(value, fallback) {
+  const cleaned = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 30);
+  return cleaned || fallback;
 }
 
 // ---- ICE servers: STUN alone can't get through symmetric/carrier-grade NAT,
@@ -81,50 +97,278 @@ app.get('/ice-servers', (req, res) => {
   res.json({ iceServers: servers });
 });
 
-// ---- Upload handling: each participant uploads their own local recording ----
-const storage = useCloudStorage
-  ? multer.memoryStorage()
-  : multer.diskStorage({
-      destination: (req, file, cb) => {
-        const room = sanitize(req.body.room, 'unknown-room');
-        const dir = path.join(RECORDINGS_DIR, room);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        cb(null, dir);
-      },
-      filename: (req, file, cb) => {
-        const name = sanitize(req.body.participant, 'guest');
-        const track = sanitize(req.body.track, 'av');
-        cb(null, `${name}-${track}-${Date.now()}.webm`);
-      }
-    });
-const upload = multer({ storage, limits: { fileSize: 4 * 1024 * 1024 * 1024 } });
+// ---- Recording sessions ----
+// One "session" is one press of Start -> Stop in a room. The server remembers
+// who was in the room when it started, so it knows how many recordings to wait
+// for before it builds the combined episode.
+const EPISODE_HEIGHT = Number(process.env.EPISODE_HEIGHT) === 1080 ? 1080 : 720;
+const SESSION_WAIT_MS = 30 * 60 * 1000;        // how long to wait for the other person's upload
+const SESSION_KEEP_MS = 6 * 60 * 60 * 1000;    // how long status info is remembered
+const PART_KEEP_MS = 2 * 60 * 60 * 1000;       // abandon half-finished uploads after this
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024;
 
-app.post('/upload', upload.single('recording'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'No file received' });
+const sessions = new Map();            // "room:sessionId" -> session
+const activeSessionByRoom = new Map(); // room -> sessionId currently recording
+const uploadsInProgress = new Map();   // uploadId -> { path, nextIndex, bytes, busy, timer }
+const completedUploads = new Map();    // uploadId -> true (so a retried "complete" is harmless)
 
-  if (!useCloudStorage) {
-    return res.json({ ok: true, filename: req.file.filename });
-  }
+const sessionKey = (room, sessionId) => `${room}:${sessionId}`;
+const cleanId = (value) => String(value || '').replace(/[^a-zA-Z0-9-_]/g, '').slice(0, 80);
 
-  const room = sanitize(req.body.room, 'unknown-room');
-  const name = sanitize(req.body.participant, 'guest');
-  const track = sanitize(req.body.track, 'av');
-  const key = `${room}/${name}-${track}-${Date.now()}.webm`;
+function setSessionStatus(session, status) {
+  session.status = status;
+  session.updatedAt = Date.now();
+}
 
+async function moveFile(src, dest) {
   try {
-    await s3.send(new PutObjectCommand({
+    await fs.promises.rename(src, dest);
+  } catch (err) {
+    if (err.code !== 'EXDEV') throw err;
+    await fs.promises.copyFile(src, dest); // temp folder can be on another disk
+    await fs.promises.unlink(src);
+  }
+}
+
+// In cloud mode a recording's temp copy is kept until the episode is built
+// (or the wait expires), then deleted.
+function releaseSessionFiles(session) {
+  for (const up of session.uploads.values()) {
+    if (up.isTemp && up.path) fs.unlink(up.path, () => {});
+    up.isTemp = false;
+  }
+}
+
+async function putToBucket(key, filePath, contentType) {
+  await new Upload({
+    client: s3,
+    params: {
       Bucket: process.env.STORAGE_BUCKET_NAME,
       Key: key,
-      Body: req.file.buffer,
-      ContentType: 'video/webm',
-    }));
-    res.json({ ok: true, filename: key });
+      Body: fs.createReadStream(filePath),
+      ContentType: contentType,
+    },
+    // Streams in parts so memory stays small however long the episode is.
+    queueSize: 2,
+    partSize: 10 * 1024 * 1024,
+  }).done();
+}
+
+// ---- Building the combined episode ----
+// Episodes are built one at a time; ffmpeg is heavy on a small free server.
+let mergeQueue = Promise.resolve();
+
+async function buildEpisode(session) {
+  const ups = [...session.uploads.values()];
+  const host = ups.find((u) => u.isHost) || ups[0];
+  const guest = ups.find((u) => u !== host);
+
+  // Each browser reported (in server-clock time) when its recorder really
+  // started. Whoever started later is delayed by the difference so both
+  // sides line up.
+  let hostDelay = 0;
+  let guestDelay = 0;
+  if (host.startedAt > 0 && guest.startedAt > 0) {
+    const diff = host.startedAt - guest.startedAt;
+    if (Math.abs(diff) <= 60000) {
+      if (diff > 0) hostDelay = diff;
+      else guestDelay = -diff;
+    }
+  }
+
+  const outName = `episode-podcast-${session.sessionId}.mp4`;
+  const tmpOut = path.join(os.tmpdir(), `patchbay-${session.room}-${session.sessionId}.mp4`);
+  try {
+    console.log(`Building episode for room "${session.room}" (host delay ${hostDelay}ms, guest delay ${guestDelay}ms)`);
+    await mergeEpisode({
+      host: { file: host.path, name: `${host.name} (host)`, delayMs: hostDelay },
+      guest: { file: guest.path, name: guest.name, delayMs: guestDelay },
+      outputPath: tmpOut,
+      height: EPISODE_HEIGHT,
+    });
+
+    if (useCloudStorage) {
+      await putToBucket(`${session.room}/${outName}`, tmpOut, 'video/mp4');
+      fs.unlink(tmpOut, () => {});
+    } else {
+      await moveFile(tmpOut, path.join(RECORDINGS_DIR, session.room, outName));
+    }
+    setSessionStatus(session, 'ready');
+    console.log(`Episode ready: ${session.room}/${outName}`);
   } catch (err) {
-    console.error('Cloud storage upload failed:', err.message);
-    res.status(500).json({ ok: false, error: 'Upload to storage failed' });
+    console.error(`Episode build failed for room "${session.room}":`, err.message);
+    fs.unlink(tmpOut, () => {});
+    setSessionStatus(session, 'failed');
+  } finally {
+    releaseSessionFiles(session);
+  }
+}
+
+function onUploadRegistered(session) {
+  const expected = session.participants.size;
+  if (expected < 2) {
+    setSessionStatus(session, 'saved'); // recorded alone: nothing to combine
+    releaseSessionFiles(session);
+    return;
+  }
+  if (session.uploads.size >= expected) {
+    clearTimeout(session.waitTimer);
+    setSessionStatus(session, 'processing');
+    mergeQueue = mergeQueue.then(() => buildEpisode(session)).catch(() => {});
+    return;
+  }
+  setSessionStatus(session, 'uploading');
+  if (!session.waitTimer) {
+    session.waitTimer = setTimeout(() => {
+      if (session.status === 'uploading') {
+        console.warn(`Gave up waiting for the other recording in room "${session.room}"`);
+        setSessionStatus(session, 'incomplete');
+        releaseSessionFiles(session);
+      }
+    }, SESSION_WAIT_MS);
+    session.waitTimer.unref?.();
+  }
+}
+
+// Forget old sessions (and free any leftover temp files) now and then.
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_KEEP_MS;
+  for (const [key, session] of sessions) {
+    if (session.updatedAt < cutoff) {
+      releaseSessionFiles(session);
+      sessions.delete(key);
+    }
+  }
+}, 30 * 60 * 1000).unref?.();
+
+// ---- Chunked, resumable uploads ----
+// Each recording is sent in small pieces. A piece that fails (common on long
+// distance links) is simply retried by the browser, instead of restarting a
+// multi-hundred-MB upload from zero.
+function dropUpload(uploadId) {
+  const up = uploadsInProgress.get(uploadId);
+  if (!up) return;
+  clearTimeout(up.timer);
+  uploadsInProgress.delete(uploadId);
+  fs.unlink(up.path, () => {});
+}
+
+app.post('/upload-chunk', express.raw({ type: '*/*', limit: '32mb' }), (req, res) => {
+  const uploadId = cleanId(req.query.uploadId);
+  const index = Number.parseInt(req.query.index, 10);
+  const body = req.body;
+  if (!uploadId || !Number.isInteger(index) || index < 0 || !Buffer.isBuffer(body) || body.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Bad chunk' });
+  }
+
+  let up = uploadsInProgress.get(uploadId);
+  if (!up) {
+    if (index !== 0) return res.status(409).json({ ok: false, error: 'Unknown upload' });
+    up = { path: path.join(os.tmpdir(), `patchbay-${uploadId}.part`), nextIndex: 0, bytes: 0, busy: false };
+    fs.writeFileSync(up.path, '');
+    up.timer = setTimeout(() => dropUpload(uploadId), PART_KEEP_MS);
+    up.timer.unref?.();
+    uploadsInProgress.set(uploadId, up);
+  }
+
+  if (up.busy) return res.status(503).json({ ok: false, error: 'Busy, retry' });
+  if (index < up.nextIndex) return res.json({ ok: true, duplicate: true }); // a retry of a chunk we already have
+  if (index > up.nextIndex) return res.status(409).json({ ok: false, error: 'Out of order', expected: up.nextIndex });
+  if (up.bytes + body.length > MAX_UPLOAD_BYTES) {
+    dropUpload(uploadId);
+    return res.status(413).json({ ok: false, error: 'Recording too large' });
+  }
+
+  up.busy = true;
+  fs.appendFile(up.path, body, (err) => {
+    up.busy = false;
+    if (err) {
+      console.error('Chunk write failed:', err.message);
+      return res.status(500).json({ ok: false, error: 'Could not store chunk' });
+    }
+    up.nextIndex += 1;
+    up.bytes += body.length;
+    res.json({ ok: true });
+  });
+});
+
+app.post('/upload-complete', express.json(), async (req, res) => {
+  const b = req.body || {};
+  const uploadId = cleanId(b.uploadId);
+  if (completedUploads.has(uploadId)) return res.json({ ok: true, duplicate: true });
+
+  const up = uploadsInProgress.get(uploadId);
+  if (!up) return res.status(404).json({ ok: false, error: 'Unknown upload' });
+  if (up.busy) return res.status(503).json({ ok: false, error: 'Busy, retry' });
+  if (Number(b.totalChunks) !== up.nextIndex) {
+    return res.status(409).json({ ok: false, error: 'Missing chunks', have: up.nextIndex });
+  }
+
+  up.busy = true;
+  try {
+    const room = sanitize(b.room, 'unknown-room');
+    const sessionId = cleanId(b.sessionId);
+    const session = sessions.get(sessionKey(room, sessionId));
+    const participantId = String(b.participantId || '');
+    const who = session?.participants.get(participantId);
+
+    const name = sanitize(who?.name || b.participant, 'guest');
+    const role = who ? (who.isHost ? 'host' : 'guest') : 'solo';
+    const ext = b.ext === 'mp4' ? 'mp4' : 'webm';
+    const fileName = `${name}-${role}-${sessionId || Date.now()}.${ext}`;
+    const contentType = ext === 'mp4' ? 'video/mp4' : 'video/webm';
+
+    let keptPath;
+    let keptIsTemp = false;
+    if (useCloudStorage) {
+      await putToBucket(`${room}/${fileName}`, up.path, contentType);
+      keptPath = up.path;   // kept until the episode is built
+      keptIsTemp = true;
+    } else {
+      const dir = path.join(RECORDINGS_DIR, room);
+      fs.mkdirSync(dir, { recursive: true });
+      keptPath = path.join(dir, fileName);
+      await moveFile(up.path, keptPath);
+    }
+
+    clearTimeout(up.timer);
+    uploadsInProgress.delete(uploadId);
+    completedUploads.set(uploadId, true);
+    if (completedUploads.size > 1000) completedUploads.delete(completedUploads.keys().next().value);
+
+    if (session && who) {
+      const previous = session.uploads.get(participantId);
+      if (previous?.isTemp && previous.path !== keptPath) fs.unlink(previous.path, () => {});
+      session.uploads.set(participantId, {
+        name: who.name,
+        isHost: who.isHost,
+        path: keptPath,
+        isTemp: keptIsTemp,
+        startedAt: Number(b.startedAt) || 0,
+      });
+      onUploadRegistered(session);
+    } else if (keptIsTemp) {
+      fs.unlink(keptPath, () => {}); // nothing will merge this one
+    }
+
+    res.json({ ok: true, fileName });
+  } catch (err) {
+    up.busy = false; // leave the file so the browser can retry "complete"
+    console.error('Finalizing upload failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not store the recording' });
   }
 });
 
+// The browser polls this after uploading to show "building episode…" and so on.
+app.get('/episode-status/:room', (req, res) => {
+  const room = sanitize(req.params.room, 'unknown-room');
+  const list = [...sessions.values()]
+    .filter((s) => s.room === room)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 5)
+    .map((s) => ({ sessionId: s.sessionId, status: s.status }));
+  res.json({ sessions: list });
+});
 
 // Force recordings to download instead of opening in the browser.
 app.get('/download-recording/:room/:filename', async (req, res) => {
@@ -240,7 +484,8 @@ io.on('connection', (socket) => {
     socket.data.name = name;
 
     const others = [...members].filter(id => id !== socket.id);
-    socket.emit('joined', { selfId: socket.id, isHost: members.size === 1 });
+    socket.data.isHost = members.size === 1;
+    socket.emit('joined', { selfId: socket.id, isHost: socket.data.isHost });
     others.forEach(id => {
       io.to(id).emit('peer-joined', { peerId: socket.id, name });
       socket.emit('peer-joined', { peerId: id, name: io.sockets.sockets.get(id)?.data?.name });
@@ -251,9 +496,50 @@ io.on('connection', (socket) => {
     io.to(to).emit('signal', { from: socket.id, data });
   });
 
-  // Host-driven synchronized recording control, relayed to all peers in room
-  socket.on('recording-command', ({ room, command }) => {
-    io.to(room).emit('recording-command', { command, ts: Date.now() });
+  // Lets each browser work out how far its clock is from the server's, so the
+  // moments two people's recorders actually started can be compared fairly.
+  socket.on('time-sync', (ack) => {
+    if (typeof ack === 'function') ack(Date.now());
+  });
+
+  // Host-driven synchronized recording control, relayed to everyone in the room.
+  socket.on('recording-command', ({ command }) => {
+    const room = socket.data.room;
+    if (!room || !socket.data.isHost) return;
+
+    if (command === 'start') {
+      const previous = activeSessionByRoom.get(room);
+      const previousSession = previous && sessions.get(sessionKey(room, previous));
+      if (previousSession && previousSession.status === 'recording') setSessionStatus(previousSession, 'incomplete');
+
+      const sessionId = String(Date.now());
+      const participants = new Map();
+      for (const id of rooms.get(room) || []) {
+        const member = io.sockets.sockets.get(id);
+        participants.set(id, {
+          name: displayName(member?.data?.name, 'Guest'),
+          isHost: Boolean(member?.data?.isHost),
+        });
+      }
+      const session = {
+        room, sessionId, participants,
+        uploads: new Map(),
+        status: 'recording',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        waitTimer: null,
+      };
+      sessions.set(sessionKey(room, sessionId), session);
+      activeSessionByRoom.set(room, sessionId);
+      io.to(room).emit('recording-command', { command: 'start', sessionId, ts: Date.now() });
+    } else if (command === 'stop') {
+      const sessionId = activeSessionByRoom.get(room);
+      if (!sessionId) return;
+      activeSessionByRoom.delete(room);
+      const session = sessions.get(sessionKey(room, sessionId));
+      if (session) setSessionStatus(session, 'uploading');
+      io.to(room).emit('recording-command', { command: 'stop', sessionId, ts: Date.now() });
+    }
   });
 
   socket.on('chat-message', ({ room, name, text }) => {
@@ -265,8 +551,16 @@ io.on('connection', (socket) => {
     if (room && rooms.has(room)) {
       const members = rooms.get(room);
       members.delete(socket.id);
-      if (members.size === 0) rooms.delete(room);
-      else rooms.set(room, members);
+      if (members.size === 0) {
+        rooms.delete(room);
+        // Everyone left mid-recording: the recorders stop on their own; now just wait for uploads.
+        const sessionId = activeSessionByRoom.get(room);
+        activeSessionByRoom.delete(room);
+        const session = sessionId && sessions.get(sessionKey(room, sessionId));
+        if (session && session.status === 'recording') setSessionStatus(session, 'uploading');
+      } else {
+        rooms.set(room, members);
+      }
       socket.to(room).emit('peer-left', { peerId: socket.id });
     }
   });

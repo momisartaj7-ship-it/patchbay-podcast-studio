@@ -59,18 +59,13 @@
   let localStream = null;
   let pc = null;
   let mediaRecorder = null;
-  let recordedChunks = [];
-  let compositeCanvas = null;
-  let compositeCtx = null;
-  let compositeAnimationFrame = null;
-  let audioContext = null;
-  let audioDestination = null;
-  let mixedAudioStream = null;
   let isRecording = false;
+  let isUploading = false;
   let timerInterval = null;
   let timerSeconds = 0;
-  let expectedUploads = 0;
-  let receivedUploads = 0;
+  let serverClockOffset = 0;   // server time minus this computer's time, in ms
+  let clockSyncTimer = null;
+  let libraryRefreshTimer = null;
 
   // Fetched from the server (see /ice-servers) so TURN credentials can be
   // configured via env vars without touching client code. Kicked off
@@ -175,8 +170,33 @@
     location.reload();
   });
 
+  // Works out how far this computer's clock is from the server's. Recording
+  // start times are compared in server time, so the two people's recordings
+  // can be lined up even if their clocks disagree. The lowest-latency sample
+  // is the most trustworthy one.
+  async function syncClock(samples = 5) {
+    let best = null;
+    for (let i = 0; i < samples; i++) {
+      const t0 = Date.now();
+      const serverNow = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 3000);
+        socket.emit('time-sync', (value) => { clearTimeout(timer); resolve(value); });
+      });
+      const t1 = Date.now();
+      if (serverNow != null) {
+        const rtt = t1 - t0;
+        if (!best || rtt < best.rtt) best = { rtt, offset: serverNow - (t0 + rtt / 2) };
+      }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    if (best) serverClockOffset = best.offset;
+  }
+
   socket.on('joined', ({ isHost: hostFlag }) => {
     isHost = hostFlag;
+    syncClock();
+    clearInterval(clockSyncTimer);
+    clockSyncTimer = setInterval(() => syncClock(3), 30000);
     btnRecord.style.display = isHost ? '' : 'none';
     connectionStatus.textContent = isHost ? 'waiting for guest…' : 'connected to host, waiting for video…';
   });
@@ -215,7 +235,7 @@
   });
 
   socket.on('peer-left', () => {
-    connectionStatus.textContent = 'guest disconnected';
+    if (!isUploading) connectionStatus.textContent = 'guest disconnected';
     tileRemoteEmpty.classList.remove('hidden');
     videoRemote.srcObject = null;
     labelRemoteName.textContent = 'Waiting…';
@@ -238,6 +258,7 @@
     };
 
     pc.onconnectionstatechange = () => {
+      if (isUploading) return; // don't hide upload progress behind call-status text
       if (pc.connectionState === 'connected') {
         connectionStatus.textContent = `connected with ${peerName}`;
       } else if (pc.connectionState === 'failed') {
@@ -266,142 +287,55 @@
   });
 
   // ---- Recording ----
-  // The host creates ONE podcast-style recording: both video feeds are rendered
-  // side-by-side onto a canvas and the host + guest audio are mixed together.
-  // This produces a single .webm episode instead of two separate participant files.
+  // Every participant records THEIR OWN camera and microphone on their own
+  // computer, so the recording never depends on how good the call was. When the
+  // host stops, each browser uploads its file and the server combines the two
+  // into one side-by-side podcast episode.
   btnRecord.addEventListener('click', () => {
     if (!isHost) return;
-    socket.emit('recording-command', {
-      room: myRoom,
-      command: isRecording ? 'stop' : 'start'
-    });
+    socket.emit('recording-command', { command: isRecording ? 'stop' : 'start' });
   });
 
-  socket.on('recording-command', ({ command }) => {
-    if (command === 'start') startPodcastRecording();
-    if (command === 'stop') stopPodcastRecording();
+  socket.on('recording-command', ({ command, sessionId }) => {
+    if (command === 'start') startLocalRecording(sessionId);
+    if (command === 'stop') stopLocalRecording();
   });
 
-  function drawVideoCover(ctx, video, x, y, w, h, mirror = true) {
-    if (!video || video.readyState < 2) {
-      ctx.fillStyle = '#0D0F13';
-      ctx.fillRect(x, y, w, h);
-      return;
-    }
-
-    const vw = video.videoWidth || 16;
-    const vh = video.videoHeight || 9;
-    const scale = Math.max(w / vw, h / vh);
-    const sw = w / scale;
-    const sh = h / scale;
-    const sx = (vw - sw) / 2;
-    const sy = (vh - sh) / 2;
-
-    ctx.save();
-
-    if (mirror) {
-      ctx.translate(x + w, y);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
-    } else {
-      ctx.drawImage(video, sx, sy, sw, sh, x, y, w, h);
-    }
-
-    ctx.restore();
+  function pickMimeType() {
+    const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    return candidates.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
   }
 
-  function drawPodcastFrame() {
-    if (!compositeCtx || !compositeCanvas) return;
-    const w = compositeCanvas.width;
-    const h = compositeCanvas.height;
-    const gap = 6;
-    const tileW = (w - gap) / 2;
+  function startLocalRecording(sessionId) {
+    if (isRecording || !localStream) return;
 
-    compositeCtx.fillStyle = '#0D0F13';
-    compositeCtx.fillRect(0, 0, w, h);
-
-    drawVideoCover(compositeCtx, videoLocal, 0, 0, tileW, h, true);
-    drawVideoCover(compositeCtx, videoRemote, tileW + gap, 0, tileW, h, true);
-
-    // Podcast-style name plates.
-    compositeCtx.fillStyle = 'rgba(20, 23, 28, 0.78)';
-    compositeCtx.fillRect(24, h - 64, Math.min(300, tileW - 48), 40);
-    compositeCtx.fillRect(tileW + gap + 24, h - 64, Math.min(300, tileW - 48), 40);
-
-    compositeCtx.fillStyle = '#FFFFFF';
-    compositeCtx.font = '600 18px Space Grotesk, sans-serif';
-    compositeCtx.fillText(`${myName} (host)`, 40, h - 38);
-    compositeCtx.fillText(`${peerName || 'Guest'}`, tileW + gap + 40, h - 38);
-
-    compositeAnimationFrame = requestAnimationFrame(drawPodcastFrame);
-  }
-
-  function createMixedAudioStream() {
-    try {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      audioDestination = audioContext.createMediaStreamDestination();
-
-      const localSource = audioContext.createMediaStreamSource(
-        new MediaStream(localStream.getAudioTracks())
-      );
-      localSource.connect(audioDestination);
-
-      const remoteStream = videoRemote.srcObject;
-      if (remoteStream?.getAudioTracks()?.length) {
-        const remoteSource = audioContext.createMediaStreamSource(
-          new MediaStream(remoteStream.getAudioTracks())
-        );
-        remoteSource.connect(audioDestination);
-      }
-
-      mixedAudioStream = audioDestination.stream;
-      return mixedAudioStream;
-    } catch (err) {
-      console.warn('Audio mixing unavailable; recording local audio only.', err);
-      return new MediaStream(localStream.getAudioTracks());
-    }
-  }
-
-  function startPodcastRecording() {
-    if (isRecording) return;
-
-    // Only the host uploads the finished composite episode.
-    if (!isHost) {
-      isRecording = true;
-      recIndicator.classList.remove('hidden');
-      startTimer();
-      return;
-    }
-
-    recordedChunks = [];
-    compositeCanvas = document.createElement('canvas');
-    compositeCanvas.width = 1920;
-    compositeCanvas.height = 1080;
-    compositeCtx = compositeCanvas.getContext('2d');
-
-    const canvasStream = compositeCanvas.captureStream(30);
-    const audioStream = createMixedAudioStream();
-    const finalStream = new MediaStream([
-      ...canvasStream.getVideoTracks(),
-      ...audioStream.getAudioTracks()
-    ]);
-
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-      ? 'video/webm;codecs=vp9,opus'
-      : 'video/webm';
-   mediaRecorder = new MediaRecorder(finalStream, {
-     mimeType,
-     videoBitsPerSecond: 8_000_000,
-     audioBitsPerSecond: 192_000
-});
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
+    // Remember everything the upload needs NOW: if the person leaves the
+    // studio mid-recording, the socket (and its id) is gone by upload time.
+    const recording = {
+      sessionId,
+      participantId: socket.id,
+      chunks: [],
+      startedAt: 0, // in server time
     };
-    mediaRecorder.onstop = uploadPodcastRecording;
-    mediaRecorder.start(1000);
 
-    drawPodcastFrame();
+    const mimeType = pickMimeType();
+    try {
+      mediaRecorder = new MediaRecorder(localStream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: 4_000_000,
+        audioBitsPerSecond: 160_000,
+      });
+    } catch (err) {
+      console.error('Could not start MediaRecorder:', err);
+      connectionStatus.textContent = 'could not start recording on this device';
+      return;
+    }
+
+    const recorder = mediaRecorder;
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) recording.chunks.push(e.data); };
+    recorder.onstart = () => { recording.startedAt = Math.round(Date.now() + serverClockOffset); };
+    recorder.onstop = () => uploadLocalRecording(recording, recorder.mimeType || mimeType);
+    recorder.start(1000);
 
     isRecording = true;
     recIndicator.classList.remove('hidden');
@@ -410,43 +344,113 @@
     startTimer();
   }
 
-  function stopPodcastRecording() {
+  function stopLocalRecording() {
     if (!isRecording) return;
-
-    if (isHost && mediaRecorder) {
-      mediaRecorder.stop();
-      if (compositeAnimationFrame) cancelAnimationFrame(compositeAnimationFrame);
-      compositeAnimationFrame = null;
-      audioContext?.close().catch(() => {});
-      audioContext = null;
-      audioDestination = null;
-      mixedAudioStream = null;
-    }
-
     isRecording = false;
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+
     recIndicator.classList.add('hidden');
     btnRecord.classList.remove('is-recording');
     btnRecord.innerHTML = '<span class="rec-btn-dot"></span> Start recording';
     stopTimer();
   }
 
-  async function uploadPodcastRecording() {
-    const blob = new Blob(recordedChunks, { type: 'video/webm' });
-    const formData = new FormData();
-    formData.append('room', myRoom);
-    formData.append('participant', 'episode');
-    formData.append('track', 'podcast');
-    formData.append('recording', blob, `podcast-${Date.now()}.webm`);
+  // Last-resort safety net: hand the recording to the user's own disk so a
+  // failed upload never means a lost episode.
+  function saveBlobLocally(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
 
-    connectionStatus.textContent = 'uploading podcast recording…';
+  async function uploadLocalRecording(recording, mimeType) {
+    const blob = new Blob(recording.chunks, { type: mimeType || 'video/webm' });
+    recording.chunks = [];
+    if (!blob.size) {
+      connectionStatus.textContent = 'nothing was recorded';
+      return;
+    }
+
+    const ext = /mp4/.test(mimeType || '') ? 'mp4' : 'webm';
+    const room = myRoom;
+    const safeName = (myName || 'recording').replace(/[^a-zA-Z0-9-_]/g, '') || 'recording';
+    const backupName = `${safeName}-${recording.sessionId || Date.now()}.${ext}`;
+
+    isUploading = true;
+    connectionStatus.textContent = 'uploading your recording… 0%';
+    let uploaded = false;
     try {
-      const res = await fetch('/upload', { method: 'POST', body: formData });
-      if (!res.ok) throw new Error('Upload failed');
-      connectionStatus.textContent = 'podcast recording uploaded';
+      await PatchbayUploader.uploadRecording(
+        blob,
+        {
+          room,
+          sessionId: recording.sessionId,
+          participantId: recording.participantId,
+          participant: myName,
+          startedAt: recording.startedAt,
+          ext,
+        },
+        {
+          onProgress: (pct) => { connectionStatus.textContent = `uploading your recording… ${pct}%`; },
+          onRetry: (attempt) => { connectionStatus.textContent = `connection is slow — retrying (${attempt})…`; },
+        }
+      );
+      uploaded = true;
     } catch (err) {
-      connectionStatus.textContent = 'upload failed — recording is still in browser memory';
+      console.warn('Upload failed:', err);
+    }
+    isUploading = false;
+
+    if (!uploaded) {
+      saveBlobLocally(blob, backupName);
+      connectionStatus.textContent = 'upload failed — a copy was saved to your Downloads folder';
+      return;
+    }
+    connectionStatus.textContent = 'your recording is uploaded';
+    followEpisode(room, recording.sessionId);
+  }
+
+  // After uploading, keep the status line updated while the server waits for
+  // the other person and then builds the combined episode.
+  const EPISODE_MESSAGES = {
+    uploading: "waiting for the other person's upload…",
+    processing: 'building your podcast episode…',
+    ready: 'episode ready — open Recordings to watch it',
+    failed: 'could not combine the recordings — each person\'s own file is saved',
+    incomplete: "the other person's recording never arrived — your own file is saved",
+    saved: 'recording saved',
+  };
+  const EPISODE_DONE = ['ready', 'failed', 'incomplete', 'saved'];
+
+  async function followEpisode(room, sessionId) {
+    for (let i = 0; i < 300; i++) { // about 20 minutes
+      try {
+        const res = await fetch(`/episode-status/${encodeURIComponent(room)}`);
+        const data = await res.json();
+        const entry = data.sessions.find((x) => x.sessionId === sessionId);
+        if (entry) {
+          if (!isUploading && !isRecording && EPISODE_MESSAGES[entry.status]) {
+            connectionStatus.textContent = EPISODE_MESSAGES[entry.status];
+          }
+          if (EPISODE_DONE.includes(entry.status)) return;
+        }
+      } catch (err) { /* keep trying */ }
+      await new Promise((r) => setTimeout(r, 4000));
     }
   }
+
+  // Closing the tab mid-upload would lose the recording; ask first.
+  window.addEventListener('beforeunload', (e) => {
+    if (isUploading) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
 
   // ---- Timer ----
   function startTimer() {
@@ -494,7 +498,8 @@
   }
 
   async function endSession() {
-    if (isRecording) stopPodcastRecording();
+    if (isRecording) stopLocalRecording();
+    clearInterval(clockSyncTimer);
 
     // Remember the room so Recordings is available from the home screen.
     localStorage.setItem('patchbay-last-room', myRoom);
@@ -513,7 +518,36 @@
     }, 1500);
   }
 
+  const LIBRARY_BANNERS = {
+    recording: '🔴 A recording is in progress in this room.',
+    uploading: '⏳ Recordings are still uploading — your episode will appear here shortly.',
+    processing: '⏳ Building your podcast episode — this can take a few minutes. This list updates by itself.',
+  };
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // File names end in the moment the recording started (e.g. ...-1790619821932.mp4).
+  function fileTimestamp(name) {
+    const m = /-(\d{12,})\.(webm|mp4)$/.exec(name);
+    return m ? Number(m[1]) : 0;
+  }
+
+  function describeFile(name) {
+    const when = fileTimestamp(name);
+    const date = when ? new Date(when).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '';
+    if (name.includes('-podcast-')) return date ? `Podcast episode · ${date}` : 'Podcast episode';
+    const m = /^(.+)-(host|guest|solo)-\d+\.(webm|mp4)$/.exec(name);
+    if (m) {
+      const who = m[2] === 'solo' ? `${m[1]} (solo recording)` : `${m[1]} — own recording`;
+      return date ? `${who} · ${date}` : who;
+    }
+    return name;
+  }
+
   async function loadRecordings(room, keepHome = false) {
+    clearTimeout(libraryRefreshTimer);
     room = (room || '').trim().toLowerCase().replace(/\s+/g, '-');
     if (!room) {
       recordingsRoomPicker.classList.remove('hidden');
@@ -529,30 +563,47 @@
     try {
       const res = await fetch(`/recordings-list/${encodeURIComponent(room)}`);
       const data = await res.json();
+
+      // Is an episode still being recorded, uploaded or built for this room?
+      let banner = '';
+      try {
+        const statusRes = await fetch(`/episode-status/${encodeURIComponent(room)}`);
+        const status = await statusRes.json();
+        const active = status.sessions.find((x) => LIBRARY_BANNERS[x.status]);
+        if (active) banner = LIBRARY_BANNERS[active.status];
+      } catch (err) { /* the list still works without it */ }
+
       filesList.innerHTML = '';
+      if (banner) {
+        const li = document.createElement('li');
+        li.className = 'files-empty';
+        li.textContent = banner;
+        filesList.appendChild(li);
+        // Check again shortly, as long as someone is looking at the recordings.
+        const looking = !recordingsScreen.classList.contains('hidden') || !endScreen.classList.contains('hidden');
+        if (looking) libraryRefreshTimer = setTimeout(() => loadRecordings(room, keepHome), 6000);
+      }
 
       if (!data.files.length) {
-        filesList.innerHTML = '<li class="files-empty">No recordings found for this room yet.</li>';
+        if (!banner) filesList.innerHTML = '<li class="files-empty">No recordings found for this room yet.</li>';
         return;
       }
 
-      // Prefer podcast recordings over any older participant recordings.
+      // Episodes first, then everyone's own files; newest first within each.
       const sorted = [...data.files].sort((a, b) => {
         const ap = a.name.includes('-podcast-') ? 0 : 1;
         const bp = b.name.includes('-podcast-') ? 0 : 1;
-        return ap - bp || b.name.localeCompare(a.name);
+        return ap - bp || fileTimestamp(b.name) - fileTimestamp(a.name) || b.name.localeCompare(a.name);
       });
 
       sorted.forEach(f => {
         const li = document.createElement('li');
         li.className = 'recording-card';
         const sizeMb = (f.size / (1024 * 1024)).toFixed(1);
-        const isPodcast = f.name.includes('-podcast-');
-        const label = isPodcast ? 'Podcast episode' : f.name;
         li.innerHTML = `
           <div class="recording-card-icon">🎙️</div>
           <div class="recording-card-main">
-            <strong>${label}</strong>
+            <strong>${escapeHtml(describeFile(f.name))}</strong>
             <span>${sizeMb} MB</span>
           </div>
           <div class="recording-card-actions">
@@ -569,9 +620,7 @@
   }
 
   function openRecording(file, room) {
-    recordingTitle.textContent = file.name.includes('-podcast-')
-      ? `Podcast episode · ${room}`
-      : file.name;
+    recordingTitle.textContent = `${describeFile(file.name)} · ${room}`;
     recordingVideo.src = file.url;
     recordingDownload.href = `/download-recording/${encodeURIComponent(room)}/${encodeURIComponent(file.name)}`;
     recordingPlayer.classList.remove('hidden');

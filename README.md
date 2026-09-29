@@ -1,23 +1,36 @@
 # Patchbay — Video Podcast Studio
 
-A browser-based, two-person video podcast studio. Riverside-style: each
-participant's camera and mic are recorded **locally in their own browser**
-at full quality, then combined by the host browser into one podcast-style side-by-side episode
-and uploaded to the server after the session. The live call still runs over
-WebRTC, while the final episode is rendered locally in the host browser. The live call itself runs over WebRTC just so both of
-you can see and hear each other while you talk.
+A browser-based, two-person video podcast studio, Riverside-style: **each
+participant records their own camera and mic locally**, on their own
+computer, so the recording quality never depends on how good the call
+between them was — even a call that drops entirely doesn't lose the
+recording. After both people upload their own file, the server combines
+them into one podcast-style side-by-side episode with mixed audio. The
+live call itself just runs over WebRTC so the two of you can see and hear
+each other while you talk — it isn't what gets recorded.
 
 ## How it works
 
 - **Live call:** peer-to-peer WebRTC, connected via a small signaling
   server (Socket.io). Video never passes through the server — only
   connection setup messages do.
-- **Recording:** when the host clicks "Start recording," the host browser
-  renders both participants side-by-side on a 1280×720 canvas, mixes host and
-  guest audio with Web Audio, and records one podcast-style `.webm` episode.
-  The host uploads that combined episode when recording stops.
-- **Files:** saved under `recordings/<room-code>/<name>-av-<timestamp>.webm`,
-  downloadable from the "session wrapped" screen at the end.
+- **Recording:** when the host clicks "Start recording," every browser in
+  the room starts recording its own camera/mic via `MediaRecorder`. When
+  the host clicks "Stop," everyone's browser stops and uploads its own
+  file — in small chunks, so a shaky connection just retries a piece
+  instead of failing the whole upload.
+- **Combining:** once both people's recordings have arrived, the server
+  uses `ffmpeg` to build one side-by-side `.mp4` episode with name plates
+  and mixed audio, correcting for the two recordings not having started
+  at the exact same instant. This can take a couple of minutes; the
+  Recordings list shows "building your episode…" until it's ready and
+  refreshes on its own.
+- **Files:** saved under `recordings/<room-code>/` — each person's own
+  original recording (`<name>-host-...webm` / `<name>-guest-...webm`) is
+  kept alongside the combined episode (`episode-podcast-....mp4`), useful
+  if you ever want to edit the two tracks separately. All are visible from
+  the "Recordings" screen, reachable any time from the entry screen — not
+  just right after leaving a session.
 
 ## Setup
 
@@ -118,13 +131,16 @@ STORAGE_BUCKET_NAME=podcast-recordings
   Let's Encrypt, or a host like Render/Railway/Fly.io that provides TLS).
 - **More than 2 people:** the signaling server is written for exactly
   one host + one guest. Supporting group sessions means moving from a
-  full-mesh WebRTC setup to an SFU (e.g. mediasoup or LiveKit).
-- **Separate audio/video tracks:** currently each participant uploads
-  one combined `.webm`. If you want separate audio-only and video-only
-  files (handy for podcast editing), record two `MediaRecorder`
-  instances from separate `MediaStream` objects (one audio-only, one
-  video-only) and upload both.
-- **Chunked/resumable uploads:** for very long episodes, switch the
-  `/upload` endpoint to accept periodic chunks (e.g. every 60 seconds)
-  instead of one upload at the end, so a crash mid-recording doesn't
-  lose the whole file.
+  full-mesh WebRTC setup to an SFU (e.g. mediasoup or LiveKit), and the
+  merge step would need to composite more than two tiles.
+- **Episode resolution:** the combined episode renders at 720p by default
+  to keep build time reasonable on a free host's limited CPU. Set
+  `EPISODE_HEIGHT=1080` as an env var for a sharper (slower to build) episode.
+- **ffmpeg on your host:** the merge step depends on the `ffmpeg-static`
+  package, which downloads a prebuilt `ffmpeg` binary for your platform
+  during `npm install`. This works on Render's standard Node environment
+  without extra setup; a more locked-down host might block that download.
+- **Long episodes on a free host:** building the episode can take a few
+  minutes and uses real CPU. Render's free tier can go to sleep after
+  inactivity and has limited resources, so a very long episode (well over
+  an hour) may need a paid tier to build reliably.
